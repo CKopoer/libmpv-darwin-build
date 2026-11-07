@@ -76,7 +76,7 @@
   };
   mpv = {
     version = "0.36.0";
-    url = "https://github.com/mpv-player/mpv/archive/refs/tags/v0.36.0.tar.gz";
+    url = "https://github.com/CKopoer/mpv/archive/refs/tags/v0.36.0.tar.gz";
     sha256 = "29abc44f8ebee013bb2f9fe14d80b30db19b534c679056e4851ceadf5a5e8bf6";
   };
   uchardet = {
