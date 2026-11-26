@@ -35,6 +35,22 @@ def download(dep):
 
 def install_inputs(archive, prefix, platform, arch):
     with zipfile.ZipFile(archive) as z:
+        if archive.stem == "MoltenVK":
+            root = "lib/MoltenVK.xcframework/"
+            plist = plistlib.loads(z.read(root + "Info.plist"))
+            for item in plist["AvailableLibraries"]:
+                if (item["SupportedPlatform"] == ("macos" if platform == "macos" else "ios")
+                        and item.get("SupportedPlatformVariant") == ("simulator" if platform == "isimulator" else None)
+                        and arch in item["SupportedArchitectures"]):
+                    libpath = item["LibraryPath"]
+                    if libpath.endswith(".framework"):
+                        libpath += "/MoltenVK"
+                    out = prefix/"lib/libMoltenVK.a"
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    out.write_bytes(z.read(root + item["LibraryIdentifier"] + "/" + libpath))
+                    break
+            else:
+                raise ValueError(f"Missing MoltenVK target {platform} {arch}")
         for info in z.infolist():
             name = info.filename.removeprefix("./")
             if info.is_dir() or ".." in Path(name).parts:

@@ -1,0 +1,31 @@
+diff --git a/player/clipboard/clipboard-mac.m b/player/clipboard/clipboard-mac.m
+index a753517..ce58df9 100644
+--- a/player/clipboard/clipboard-mac.m
++++ b/player/clipboard/clipboard-mac.m
+@@ -15,6 +15,8 @@
+  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
+  */
+ 
++#include "config.h"
++#if HAVE_SWIFT
+ #include "clipboard.h"
+ #include "osdep/mac/swift.h"
+ 
+@@ -57,3 +59,4 @@ const struct clipboard_backend clipboard_backend_mac = {
+     .get_data = get_data,
+     .set_data = set_data,
+ };
++#endif
+diff --git a/player/clipboard/clipboard.c b/player/clipboard/clipboard.c
+index 9a21ff6..f7d425e 100644
+--- a/player/clipboard/clipboard.c
++++ b/player/clipboard/clipboard.c
+@@ -39,7 +39,7 @@ static const struct clipboard_backend *const clipboard_backend_list[] = {
+ #if HAVE_WIN32_DESKTOP
+     &clipboard_backend_win32,
+ #endif
+-#if HAVE_COCOA
++#if HAVE_COCOA && HAVE_SWIFT
+     &clipboard_backend_mac,
+ #endif
+ #if HAVE_WAYLAND && HAVE_WAYLAND_PROTOCOLS_1_39
