@@ -115,7 +115,8 @@ pkg_config_libdir = '{pcs}'
              if platform == "macos" else ["-Daudiounit=enabled", "-Dios-gl=enabled"])
     run("meson","setup","mpv-build","mpv","--cross-file",cross,"--wrap-mode=nodownload",*opts)
     run("ninja","-C","mpv-build","libmpv.a")
-    libs = sorted((prefix / "lib").glob("*.a"))
+    moltenvk = prefix / "lib/libMoltenVK.a"
+    libs = sorted(p for p in (prefix / "lib").glob("*.a") if p != moltenvk)
     # Leave only public libmpv and the opt-in probe visible to other plugins.
     # In particular, BiliSail's downloadable-media mux owns a separate FFmpeg ABI.
     exports = Path("symbols.list")
@@ -129,7 +130,7 @@ pkg_config_libdir = '{pcs}'
     out.parent.mkdir(parents=True,exist_ok=True)
     run("xcrun","--sdk",sdk,"clang++",*link,"-dynamiclib","-Wl,-headerpad_max_install_names",
         "-Wl,-install_name,@rpath/Mpv.framework/Mpv","-Wl,-exported_symbols_list,"+str(exports),
-        "-Wl,-force_load,mpv-build/libmpv.a",*libs,
+        "-Wl,-force_load,mpv-build/libmpv.a","-Wl,-force_load," + str(moltenvk),*libs,
         *[a for f in frameworks for a in ["-framework",f]],"-lz","-lbz2","-liconv",
         "-lxml2","-lexpat","-lresolv","-lc++","-o",out)
     run("xcrun","vtool","-show-build",out)
@@ -164,8 +165,9 @@ def package(osname):
         catalog.append(desc)
         (framework/"Info.plist").write_bytes(plistlib.dumps(dict(CFBundleExecutable="Mpv",CFBundleIdentifier="dev.bilisail.media.mpv",CFBundlePackageType="FMWK",CFBundleVersion="1")))
     (bundle/"Info.plist").write_bytes(plistlib.dumps(dict(XCFrameworkFormatVersion="1.0",CFBundlePackageType="XFWK",AvailableLibraries=catalog)))
-    shutil.copytree(HERE,root/"source",ignore=shutil.ignore_patterns("__pycache__"))
-    (root/"licenses").mkdir()
+    shutil.copytree(HERE,root/"source",ignore=shutil.ignore_patterns("__pycache__", "licenses"))
+    shutil.copytree(HERE/"licenses", root/"licenses")
+    shutil.copyfile(".github/workflows/bilisail-metal-probe.yml",root/"source/workflow.yml")
     shutil.copyfile("mpv/LICENSE.LGPL",root/"licenses/mpv-LGPL.txt")
     run("tar","-czf",Path(f"bilisail-edr-{osname}.tar.gz").resolve(),"-C",root,".")
 
