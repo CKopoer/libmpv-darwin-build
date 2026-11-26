@@ -104,7 +104,7 @@ pkg_config_libdir = '{pcs}'
                   "CoreVideo","CoreGraphics","CoreText","Metal","IOSurface","QuartzCore",
                   "VideoToolbox","Security","CoreFoundation","ImageIO","Accelerate",
                   "CoreImage","MetalKit","GameController","Network"]
-    frameworks += ["AppKit","IOKit","OpenGL","CoreServices"] if platform=="macos" else ["UIKit","OpenGLES"]
+    frameworks += ["AppKit","IOKit","OpenGL","CoreServices","AudioUnit"] if platform=="macos" else ["UIKit","OpenGLES"]
     out = Path("slices") / key / "Mpv"
     out.parent.mkdir(parents=True,exist_ok=True)
     run("xcrun","--sdk",sdk,"clang++",*link,"-dynamiclib","-Wl,-headerpad_max_install_names",
@@ -114,12 +114,19 @@ pkg_config_libdir = '{pcs}'
         "-lxml2","-lexpat","-lresolv","-lc++","-o",out)
     run("xcrun","vtool","-show-build",out)
     run("xcrun","otool","-L",out)
+    run("xcrun", "--sdk", sdk, "clang", "-fobjc-arc", *flags, "-I", "mpv/include",
+        "-fsyntax-only", HERE / "joc_probe.m")
     if key=="mac-arm":
         run("clang","-I","mpv/include","-x","c",HERE/"smoke.c","-x","none",out,"-o","smoke")
         run("install_name_tool","-change","@rpath/Mpv.framework/Mpv",out.resolve(),"smoke")
         run("codesign","--force","--sign","-",out)
         run("codesign","--force","--sign","-","smoke")
         run("./smoke")
+        run("clang", "-fobjc-arc", "-I", "mpv/include", HERE/"joc_probe.m", out,
+            "-framework", "AVFoundation", "-framework", "CoreMedia", "-framework", "Foundation",
+            "-o", "joc-probe")
+        run("install_name_tool", "-change", "@rpath/Mpv.framework/Mpv", out.resolve(), "joc-probe")
+        run("codesign", "--force", "--sign", "-", "joc-probe")
 
 def package(osname):
     slices = [("macos-arm64_x86_64", ["mac-arm","mac-intel"], ["arm64","x86_64"],None)] if osname=="macos" else [

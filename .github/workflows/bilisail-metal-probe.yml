@@ -39,6 +39,12 @@ jobs:
           git -C mpv apply ../kit/Sources/BuildScripts/patch/libmpv/0001-player-add-moltenvk-context.patch
           git -C mpv apply ../bilisail/joc-packet-probe.patch
           python3 bilisail/build.py build ${{ matrix.target }}
+      - name: Exercise compressed JOC renderer
+        if: matrix.target == 'mac-arm'
+        run: |
+          curl --fail --silent --show-error -L --range 0-33554431 --max-time 180 'https://media.developer.dolby.com/DolbyVision_Atmos/mp4/iOS_P5_GlassBlowing2_1920x1080%4059.94fps_15200kbps.mp4' -o sample-prefix.mp4
+          echo '2e1a62c39519ccef267353672aff6c2985b7ef145739fb60b56029fa91ec6fac  sample-prefix.mp4' | shasum -a 256 -c -
+          ./joc-probe sample-prefix.mp4
       - uses: actions/upload-artifact@v4
         with:
           name: slice-${{ matrix.target }}
