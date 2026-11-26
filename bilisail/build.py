@@ -66,7 +66,11 @@ def build(key):
     sdkroot = subprocess.check_output(["xcrun", "--sdk", sdk, "--show-sdk-path"], text=True).strip()
     flags = ["-target", triple, "-isysroot", sdkroot, "-I" + str(prefix / "include")]
     link = ["-target", triple, "-isysroot", sdkroot, "-L" + str(prefix / "lib")]
-    pcs = str(prefix / "lib/pkgconfig")
+    pcdir = prefix / "lib/pkgconfig"
+    # Apple's SDK provides zlib headers and the target-specific linker stub.
+    version = re.search(r'#define ZLIB_VERSION "([^"]+)"', (Path(sdkroot)/"usr/include/zlib.h").read_text()).group(1)
+    (pcdir/"zlib.pc").write_text(f"Name: zlib\nDescription: Apple SDK zlib\nVersion: {version}\nLibs: -lz\n")
+    pcs = str(pcdir)
     cross = Path("cross.ini").resolve()
     cross.write_text(f"""[binaries]
 c = 'clang'
