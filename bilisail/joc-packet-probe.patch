@@ -1,0 +1,72 @@
+diff --git a/audio/decode/ad_lavc.c b/audio/decode/ad_lavc.c
+index 9c83892..62e30d2 100644
+--- a/audio/decode/ad_lavc.c
++++ b/audio/decode/ad_lavc.c
+@@ -33,6 +33,7 @@
+ #include "audio/fmt-conversion.h"
+ #include "common/av_common.h"
+ #include "common/codecs.h"
++#include "common/global.h"
+ #include "common/msg.h"
+ #include "demux/packet.h"
+ #include "demux/stheader.h"
+@@ -163,6 +164,8 @@ static void ad_lavc_destroy(struct mp_filter *da)
+ static void ad_lavc_reset(struct mp_filter *da)
+ {
+     struct priv *ctx = da->priv;
++    if (ctx->avctx && ctx->avctx->codec_id == AV_CODEC_ID_EAC3 && da->global->joc_probe)
++        da->global->joc_probe(da->global->joc_probe_context, NULL, 0, 0, 0);
+ 
+     avcodec_flush_buffers(ctx->avctx);
+     ctx->skip_samples = 0;
+@@ -186,6 +189,12 @@ static int send_packet(struct mp_filter *da, struct demux_packet *mpkt)
+     mp_set_av_packet(priv->avpkt, mpkt, &priv->codec_timebase);
+ 
+     int ret = avcodec_send_packet(avctx, mpkt ? priv->avpkt : NULL);
++    // A successfully accepted compressed input. Do not duplicate a packet
++    // when FFmpeg asks mpv to retry. Bytes are borrowed for this call only.
++    if (ret == 0 && mpkt && avctx->codec_id == AV_CODEC_ID_EAC3 &&
++        da->global->joc_probe && mpkt->pts != MP_NOPTS_VALUE)
++        da->global->joc_probe(da->global->joc_probe_context, mpkt->buffer, mpkt->len,
++                              mpkt->pts, mpkt->duration);
+     if (ret < 0)
+         MP_ERR(da, "Error decoding audio.\n");
+     return ret;
+diff --git a/common/global.h b/common/global.h
+index c05b70e..2795ed6 100644
+--- a/common/global.h
++++ b/common/global.h
+@@ -11,6 +11,9 @@ struct mpv_global {
+     char *configdir;
+     struct stats_base *stats;
+     struct demux_packet_pool *packet_pool;
++    // Installed before initialization by the Darwin compressed-audio probe only.
++    void *joc_probe_context;
++    void (*joc_probe)(void *, const unsigned char *, int, double, double);
+ };
+ 
+ #endif
+diff --git a/player/client.c b/player/client.c
+index e23b98b..5dbbfbd 100644
+--- a/player/client.c
++++ b/player/client.c
+@@ -340,6 +340,19 @@ struct mpv_global *mp_client_get_global(struct mpv_handle *ctx)
+     return ctx->mpctx->global;
+ }
+ 
++MPV_EXPORT int bilisail_joc_probe_install(mpv_handle *ctx, void *opaque,
++    void (*callback)(void *, const unsigned char *, int, double, double))
++{
++    if (!ctx || ctx->mpctx->initialized || !callback)
++        return MPV_ERROR_INVALID_PARAMETER;
++    struct mpv_global *global = mp_client_get_global(ctx);
++    if (global->joc_probe)
++        return MPV_ERROR_INVALID_PARAMETER;
++    global->joc_probe_context = opaque;
++    global->joc_probe = callback;
++    return 0;
++}
++
+ static void wakeup_client(struct mpv_handle *ctx)
+ {
+     mp_mutex_lock(&ctx->wakeup_lock);

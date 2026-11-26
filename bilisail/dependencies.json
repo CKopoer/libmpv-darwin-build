@@ -1,0 +1,87 @@
+[
+  {
+    "name": "FFmpeg",
+    "url": "https://github.com/mpvkit/MPVKit/releases/download/1.1.0-n9.0.2/FFmpeg-all.zip",
+    "sha256": "5e3b64732c820e3ee0fd6d04f147d7fa68a915d5d6a1fae073ce532eefd01c13"
+  },
+  {
+    "name": "openssl",
+    "url": "https://github.com/mpvkit/openssl-build/releases/download/3.3.5/openssl-all.zip",
+    "sha256": "8bc37424aa98fdeac17fd00fbeea7b784a39f1f800cc7f9e0c948d3b169c6f2f"
+  },
+  {
+    "name": "gmp",
+    "url": "https://github.com/mpvkit/gnutls-build/releases/download/3.8.11/gmp-all.zip",
+    "sha256": "cef5c3ff12260528a5971d2bd7bb3bc31ae85fac1235c06eff3de96c28c38aa2"
+  },
+  {
+    "name": "gnutls",
+    "url": "https://github.com/mpvkit/gnutls-build/releases/download/3.8.11/gnutls-all.zip",
+    "sha256": "6e125d9d7be4e09e112950703b0563324f5a05e546782e542b353db360f59b59"
+  },
+  {
+    "name": "nettle",
+    "url": "https://github.com/mpvkit/gnutls-build/releases/download/3.8.11/nettle-all.zip",
+    "sha256": "7c1606e5acdc0be563f5a6bb19cd2fe3e1e93b30154ac22fc2f80bffcf3151c2"
+  },
+  {
+    "name": "libass",
+    "url": "https://github.com/mpvkit/libass-build/releases/download/0.17.5/libass-all.zip",
+    "sha256": "d5e4b6046d0a4198fb97083816348b2229071749de8c429747a9558c325a1d3a"
+  },
+  {
+    "name": "libfreetype",
+    "url": "https://github.com/mpvkit/libass-build/releases/download/0.17.5/libfreetype-all.zip",
+    "sha256": "d5fb41dd3d66c6e433b389a398571b51b8d65f3f9e81f10ee61d5434a647749e"
+  },
+  {
+    "name": "libfribidi",
+    "url": "https://github.com/mpvkit/libass-build/releases/download/0.17.5/libfribidi-all.zip",
+    "sha256": "7ae8cf8c8b16a8b4ebc004f3368044d9baf8454398d18d9e8bc37964b04a2fe6"
+  },
+  {
+    "name": "libharfbuzz",
+    "url": "https://github.com/mpvkit/libass-build/releases/download/0.17.5/libharfbuzz-all.zip",
+    "sha256": "ff67179fb84a9a0f34b2ba276c4028823fecd90315cf18496be400cdfc768a3e"
+  },
+  {
+    "name": "libunibreak",
+    "url": "https://github.com/mpvkit/libass-build/releases/download/0.17.5/libunibreak-all.zip",
+    "sha256": "a7a9c0afa36e2301eec583e5575c30c1609357045d718565d06faf93abc56617"
+  },
+  {
+    "name": "lcms2",
+    "url": "https://github.com/mpvkit/lcms2-build/releases/download/2.17.0/lcms2-all.zip",
+    "sha256": "8c118b2c04e2440ecf25ffebfa7952ebb09aba83a71378e3b9ed45dae3a6115a"
+  },
+  {
+    "name": "libplacebo",
+    "url": "https://github.com/mpvkit/libplacebo-build/releases/download/7.360.1/libplacebo-all.zip",
+    "sha256": "cdb8a07563bca119ca909ab4a3503825c27678736cdab294338b0a7dbe2cf35c"
+  },
+  {
+    "name": "libdav1d",
+    "url": "https://github.com/mpvkit/libdav1d-build/releases/download/1.5.3/libdav1d-all.zip",
+    "sha256": "5d9ca131372bc9513100dbc43a59582ad1cf7acf6136ad4e6fecd63dc0075d82"
+  },
+  {
+    "name": "libdovi",
+    "url": "https://github.com/mpvkit/libdovi-build/releases/download/3.3.2/libdovi-all.zip",
+    "sha256": "81b85386016a012391c473674ef96e4e494fa76aef2f7b6c102a335e844644f8"
+  },
+  {
+    "name": "MoltenVK",
+    "url": "https://github.com/mpvkit/moltenvk-build/releases/download/1.4.2/MoltenVK-all.zip",
+    "sha256": "551bf9ee4e6fe1f9a148a6aef8eff5e5e6e0c0be9dedda2405812023d4a38c60"
+  },
+  {
+    "name": "libshaderc",
+    "url": "https://github.com/mpvkit/libshaderc-build/releases/download/2025.5.0/libshaderc-all.zip",
+    "sha256": "1079da73a292e5b2cea6a02fa2208c4935ead79a98043f81708424510e0ab53f"
+  },
+  {
+    "name": "libuavs3d",
+    "url": "https://github.com/mpvkit/libuavs3d-build/releases/download/1.2.1-fix/libuavs3d-all.zip",
+    "sha256": "8644c7a8182679dbe762b522356606220bb6d2196a5ec65511eda42ef48b3e7a"
+  }
+]
