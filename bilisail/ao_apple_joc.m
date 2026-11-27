@@ -202,7 +202,7 @@ static void get_state(struct ao *ao, struct mp_pcm_state *s)
         }
         // Apple's ready flag is advisory. A route can keep it low until
         // there is less than one compressed packet of playback left. Keep
-        // 250 ms scheduled in that case, with a one-second hard limit.
+        // 250 ms scheduled in that case, within the normal device limit.
         int limit = p->renderer.readyForMoreMediaData ? ao->device_buffer : ao->samplerate / 4;
         int space = limit - queued;
         *s = (struct mp_pcm_state){
@@ -262,7 +262,9 @@ static int init(struct ao *ao)
     [p->sync addRenderer:p->renderer];
     p->sync.delaysRateChangeUntilHasSufficientMediaData = YES;
     p->volume = -1;
-    ao->device_buffer = ao->samplerate; // room for the system's compressed-audio preroll
+    // mpv also allocates a software queue of this size and drains both on
+    // pause near EOF. Leave room for preroll while bounding that drain.
+    ao->device_buffer = ao->samplerate / 2;
     return 0;
 }
 
