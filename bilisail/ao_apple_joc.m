@@ -146,8 +146,8 @@ static bool write_frame(struct ao *ao, void **data, int frames)
         struct mp_aframe *frame = *data;
         AVBufferRef *packet = mp_aframe_get_raw_avframe(frame)->buf[1];
         int samples = mp_aframe_get_size(frame);
-        // Use consecutive sample positions. On actual starvation mpv calls
-        // start again; only then does a new rendering timeline begin.
+        // Preserve contiguous timestamps unless the audio clock has already
+        // passed the last queued sample after an actual underrun.
         int64_t clock = now(ao);
         int64_t start = MPMAX(clock, p->end);
         p->end = start + samples;
@@ -219,10 +219,14 @@ static void get_state(struct ao *ao, struct mp_pcm_state *s)
         } else if (wall - p->last_progress_ns > MP_TIME_S_TO_NS(2)) {
             reject(ao, "render clock stalled");
         }
+        // Apple's ready flag is advisory. A route can keep it low until
+        // there is less than one compressed packet of playback left. Keep
+        // 250 ms scheduled in that case, with a one-second hard limit.
+        int limit = p->renderer.readyForMoreMediaData ? ao->device_buffer : ao->samplerate / 4;
+        int space = limit - queued;
         *s = (struct mp_pcm_state){
             .queued_samples = queued,
-            .free_samples = !p->failed && p->renderer.readyForMoreMediaData &&
-                ao->device_buffer - queued >= 1536 ? ao->device_buffer - queued : 0,
+            .free_samples = !p->failed && space >= 1536 ? space : 0,
             .delay = (double)queued / ao->samplerate,
             .playing = queued > 0,
         };
