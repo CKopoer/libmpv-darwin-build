@@ -13,19 +13,7 @@
 #include "common/msg.h"
 #include "osdep/timer.h"
 
-// Notifications can arrive off the mpv audio thread or during destruction.
-// The observer owns only a flag; it never dereferences an mpv or renderer pointer.
-@interface BiliJocRouteObserver : NSObject
-@property(atomic) BOOL outputChanged;
-- (void)outputChanged:(NSNotification *)notification;
-@end
-@implementation BiliJocRouteObserver
-- (void)outputChanged:(NSNotification *)notification { self.outputChanged = YES; }
-@end
-
 struct priv {
-    BiliJocRouteObserver *route;
-    bool monitoring_route;
     bool started;
     int64_t last_clock;
     int64_t last_progress_ns;
@@ -199,18 +187,11 @@ static void get_state(struct ao *ao, struct mp_pcm_state *s)
         int queued = MPCLAMP(p->end - clock, 0, ao->device_buffer);
         if (p->renderer.status == AVQueuedSampleBufferRenderingStatusFailed)
             reject(ao, "renderer failed");
-        if (p->monitoring_route && p->route.outputChanged)
-            reject(ao, "output configuration or queued media changed");
         if (!p->failed && p->submitted &&
             p->renderer.status == AVQueuedSampleBufferRenderingStatusRendering) {
-            if (!p->monitoring_route) {
-                // Initial negotiation may notify before the first packet.
-                p->route.outputChanged = NO;
-                p->monitoring_route = true;
-            }
             atomic_store(&ao->global->apple_joc_packets, p->submitted);
         }
-        // A route may leave the renderer waiting without a failed status.
+        // An incomplete preroll can leave the clock waiting without an error.
         // Paused and empty queues have no obligation to advance.
         int64_t wall = mp_time_ns();
         if (!p->started || !queued || clock != p->last_clock) {
@@ -247,7 +228,6 @@ static void reset(struct ao *ao)
 {
     struct priv *p = ao->priv;
     p->started = false;
-    p->monitoring_route = false;
     [p->sync setRate:0 time:kCMTimeZero];
     [p->renderer flush];
     p->end = 0;
@@ -258,11 +238,6 @@ static void reset(struct ao *ao)
 static void uninit(struct ao *ao)
 {
     struct priv *p = ao->priv;
-    if (p->route) {
-        [NSNotificationCenter.defaultCenter removeObserver:p->route];
-        [p->route release];
-        p->route = nil;
-    }
     reset(ao);
     if (p->format) CFRelease(p->format);
     [p->sync release];
@@ -285,12 +260,6 @@ static int init(struct ao *ao)
         return -1;
     }
     [p->sync addRenderer:p->renderer];
-    p->route = [BiliJocRouteObserver new];
-    NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
-    [center addObserver:p->route selector:@selector(outputChanged:)
-                   name:AVSampleBufferAudioRendererWasFlushedAutomaticallyNotification object:p->renderer];
-    [center addObserver:p->route selector:@selector(outputChanged:)
-                   name:AVSampleBufferAudioRendererOutputConfigurationDidChangeNotification object:p->renderer];
     p->sync.delaysRateChangeUntilHasSufficientMediaData = YES;
     p->volume = -1;
     ao->device_buffer = ao->samplerate; // room for the system's compressed-audio preroll
