@@ -159,7 +159,7 @@ index 4e5e9e3..22377c0 100644
      struct ao_opts *opts = mp_get_config_group(tmp, global, &ao_conf);
      struct mp_log *log = mp_log_new(tmp, global->log, "ao");
 diff --git a/audio/out/buffer.c b/audio/out/buffer.c
-index 277b524..83fa661 100644
+index 277b524..369ad6b 100644
 --- a/audio/out/buffer.c
 +++ b/audio/out/buffer.c
 @@ -156,6 +156,8 @@ static int read_buffer(struct ao *ao, void **data, int samples, bool *eof,
@@ -171,6 +171,46 @@ index 277b524..83fa661 100644
          void **pd = (void *)mp_aframe_get_data_rw(p->pending);
          if (pd)
              ao_post_process_data(ao, pd, mp_aframe_get_size(p->pending));
+@@ -622,7 +624,7 @@ static bool realloc_buf(struct ao *ao, int samples)
+ }
+ 
+ // called locked
+-static bool ao_play_data(struct ao *ao)
++static bool ao_play_data(struct ao *ao, double *poll_interval)
+ {
+     struct buffer_state *p = ao->buffer_state;
+ 
+@@ -631,6 +633,11 @@ static bool ao_play_data(struct ao *ao)
+ 
+     struct mp_pcm_state state;
+     get_dev_state(ao, &state);
++    if (ao->format == AF_FORMAT_APPLE_JOC && state.queued_samples > 0) {
++        // The compressed renderer may exert backpressure before the advertised
++        // device buffer is full. Poll before the *actual* queued audio expires.
++        *poll_interval = MPCLAMP(state.delay * 0.25, 0.004, *poll_interval);
++    }
+ 
+     if (p->streaming && !state.playing && !ao->untimed)
+         goto eof;
+@@ -711,7 +718,8 @@ static MP_THREAD_VOID ao_thread(void *arg)
+     while (1) {
+         mp_mutex_lock(&p->lock);
+ 
+-        bool retry = ao_play_data(ao);
++        double poll_interval = ao->device_buffer / (double)ao->samplerate * 0.25;
++        bool retry = ao_play_data(ao, &poll_interval);
+ 
+         // Wait until the device wants us to write more data to it.
+         // Fallback to guessing.
+@@ -720,7 +728,7 @@ static MP_THREAD_VOID ao_thread(void *arg)
+             // Wake up again if half of the audio buffer has been played.
+             // Since audio could play at a faster or slower pace, wake up twice
+             // as often as ideally needed.
+-            timeout = MP_TIME_S_TO_NS(ao->device_buffer / (double)ao->samplerate * 0.25);
++            timeout = MP_TIME_S_TO_NS(poll_interval);
+         }
+ 
+         mp_mutex_unlock(&p->lock);
 diff --git a/common/global.h b/common/global.h
 index 2795ed6..1f555e7 100644
 --- a/common/global.h

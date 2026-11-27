@@ -11,8 +11,25 @@
 #include "common/common.h"
 #include "common/global.h"
 #include "common/msg.h"
+#include "osdep/timer.h"
+
+// Notifications can arrive off the mpv audio thread or during destruction.
+// The observer owns only a flag; it never dereferences an mpv or renderer pointer.
+@interface BiliJocRouteObserver : NSObject
+@property(atomic) BOOL outputChanged;
+- (void)outputChanged:(NSNotification *)notification;
+@end
+@implementation BiliJocRouteObserver
+- (void)outputChanged:(NSNotification *)notification { self.outputChanged = YES; }
+@end
 
 struct priv {
+    BiliJocRouteObserver *route;
+    bool monitoring_route;
+    bool started;
+    int64_t last_clock;
+    int64_t last_progress_ns;
+    float volume;
     AVSampleBufferAudioRenderer *renderer;
     AVSampleBufferRenderSynchronizer *sync;
     CMAudioFormatDescriptionRef format;
@@ -102,15 +119,15 @@ done:
     return fmt;
 }
 
-static void reject(struct ao *ao)
+static void reject(struct ao *ao, const char *reason)
 {
     struct priv *p = ao->priv;
     if (p->failed) return;
     p->failed = true;
     atomic_store(&ao->global->apple_joc_packets, 0);
     atomic_store(&ao->global->apple_joc_failed, true);
-    MP_WARN(ao, "Compressed renderer rejected audio (OSStatus %ld); reopening PCM.\n",
-            (long)p->renderer.error.code);
+    MP_WARN(ao, "Compressed audio %s (OSStatus %ld); reopening PCM.\n",
+            reason, (long)p->renderer.error.code);
     ao_request_reload(ao);
 }
 
@@ -129,7 +146,10 @@ static bool write_frame(struct ao *ao, void **data, int frames)
         struct mp_aframe *frame = *data;
         AVBufferRef *packet = mp_aframe_get_raw_avframe(frame)->buf[1];
         int samples = mp_aframe_get_size(frame);
-        int64_t start = MPMAX(now(ao), p->end);
+        // Use consecutive sample positions. On actual starvation mpv calls
+        // start again; only then does a new rendering timeline begin.
+        int64_t clock = now(ao);
+        int64_t start = MPMAX(clock, p->end);
         p->end = start + samples;
         if (!packet) return true; // mpv inserted a timed silence interval.
         if (!p->format) p->format = make_format(ao, packet, samples);
@@ -145,7 +165,17 @@ static bool write_frame(struct ao *ao, void **data, int frames)
         }
         if (block) CFRelease(block);
         if (!sample) {
-            reject(ao);
+            reject(ao, "sample creation failed");
+            return false;
+        }
+        // A demux packet and the trimmed decoder frame need not cover the
+        // same number of samples. Scheduling a whole compressed packet into
+        // a shorter slot makes it overlap the following packet.
+        CMTime duration = CMSampleBufferGetDuration(sample);
+        if (CMTIME_IS_NUMERIC(duration) &&
+            CMTimeCompare(duration, CMTimeMake(samples, ao->samplerate)) != 0) {
+            CFRelease(sample);
+            reject(ao, "packet duration mismatch");
             return false;
         }
         [p->renderer enqueueSampleBuffer:sample];
@@ -159,11 +189,36 @@ static void get_state(struct ao *ao, struct mp_pcm_state *s)
 {
     @autoreleasepool {
         struct priv *p = ao->priv;
-        p->renderer.volume = MPCLAMP(atomic_load(&ao->gain), 0, 1);
-        if (p->renderer.status == AVQueuedSampleBufferRenderingStatusFailed) reject(ao);
-        if (!p->failed && p->renderer.status == AVQueuedSampleBufferRenderingStatusRendering)
+        float gain = atomic_load(&ao->gain);
+        float volume = MPCLAMP(gain, 0, 1);
+        if (volume != p->volume) {
+            p->renderer.volume = volume;
+            p->volume = volume;
+        }
+        int64_t clock = now(ao);
+        int queued = MPCLAMP(p->end - clock, 0, ao->device_buffer);
+        if (p->renderer.status == AVQueuedSampleBufferRenderingStatusFailed)
+            reject(ao, "renderer failed");
+        if (p->monitoring_route && p->route.outputChanged)
+            reject(ao, "output configuration or queued media changed");
+        if (!p->failed && p->submitted &&
+            p->renderer.status == AVQueuedSampleBufferRenderingStatusRendering) {
+            if (!p->monitoring_route) {
+                // Initial negotiation may notify before the first packet.
+                p->route.outputChanged = NO;
+                p->monitoring_route = true;
+            }
             atomic_store(&ao->global->apple_joc_packets, p->submitted);
-        int queued = MPCLAMP(p->end - now(ao), 0, ao->device_buffer);
+        }
+        // A route may leave the renderer waiting without a failed status.
+        // Paused and empty queues have no obligation to advance.
+        int64_t wall = mp_time_ns();
+        if (!p->started || !queued || clock != p->last_clock) {
+            p->last_progress_ns = wall;
+            p->last_clock = clock;
+        } else if (wall - p->last_progress_ns > MP_TIME_S_TO_NS(2)) {
+            reject(ao, "render clock stalled");
+        }
         *s = (struct mp_pcm_state){
             .queued_samples = queued,
             .free_samples = !p->failed && p->renderer.readyForMoreMediaData &&
@@ -177,6 +232,8 @@ static void get_state(struct ao *ao, struct mp_pcm_state *s)
 static bool set_pause(struct ao *ao, bool paused)
 {
     struct priv *p = ao->priv;
+    p->started = !paused;
+    p->last_progress_ns = mp_time_ns();
     [p->sync setRate:paused ? 0 : 1];
     return true;
 }
@@ -185,6 +242,8 @@ static void start(struct ao *ao) { set_pause(ao, false); }
 static void reset(struct ao *ao)
 {
     struct priv *p = ao->priv;
+    p->started = false;
+    p->monitoring_route = false;
     [p->sync setRate:0 time:kCMTimeZero];
     [p->renderer flush];
     p->end = 0;
@@ -195,6 +254,11 @@ static void reset(struct ao *ao)
 static void uninit(struct ao *ao)
 {
     struct priv *p = ao->priv;
+    if (p->route) {
+        [NSNotificationCenter.defaultCenter removeObserver:p->route];
+        [p->route release];
+        p->route = nil;
+    }
     reset(ao);
     if (p->format) CFRelease(p->format);
     [p->sync release];
@@ -217,8 +281,15 @@ static int init(struct ao *ao)
         return -1;
     }
     [p->sync addRenderer:p->renderer];
-    p->sync.delaysRateChangeUntilHasSufficientMediaData = NO;
-    ao->device_buffer = MPMAX(3072, ao->samplerate / 4);
+    p->route = [BiliJocRouteObserver new];
+    NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
+    [center addObserver:p->route selector:@selector(outputChanged:)
+                   name:AVSampleBufferAudioRendererWasFlushedAutomaticallyNotification object:p->renderer];
+    [center addObserver:p->route selector:@selector(outputChanged:)
+                   name:AVSampleBufferAudioRendererOutputConfigurationDidChangeNotification object:p->renderer];
+    p->sync.delaysRateChangeUntilHasSufficientMediaData = YES;
+    p->volume = -1;
+    ao->device_buffer = ao->samplerate; // room for the system's compressed-audio preroll
     return 0;
 }
 
