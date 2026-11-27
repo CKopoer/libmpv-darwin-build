@@ -185,9 +185,9 @@ index 277b524..369ad6b 100644
      struct mp_pcm_state state;
      get_dev_state(ao, &state);
 +    if (ao->format == AF_FORMAT_APPLE_JOC && state.queued_samples > 0) {
-+        // The compressed renderer may exert backpressure before the advertised
-+        // device buffer is full. Poll before the *actual* queued audio expires.
-+        *poll_interval = MPCLAMP(state.delay * 0.25, 0.004, *poll_interval);
++        // Compressed access units last up to 32 ms. Refill within half a
++        // packet even when the advertised device buffer is comfortably full.
++        *poll_interval = MPCLAMP(state.delay * 0.25, 0.004, 0.016);
 +    }
  
      if (p->streaming && !state.playing && !ao->untimed)

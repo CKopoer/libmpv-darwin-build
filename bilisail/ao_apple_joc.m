@@ -200,11 +200,11 @@ static void get_state(struct ao *ao, struct mp_pcm_state *s)
         } else if (wall - p->last_progress_ns > MP_TIME_S_TO_NS(2)) {
             reject(ao, "render clock stalled");
         }
-        // Apple's ready flag is advisory. A route can keep it low until
-        // there is less than one compressed packet of playback left. Keep
-        // 250 ms scheduled in that case, within the normal device limit.
-        int limit = p->renderer.readyForMoreMediaData ? ao->device_buffer : ao->samplerate / 4;
-        int space = limit - queued;
+        // The AVFoundation clock can remain continuous while its decoder
+        // misses part of a packet delivered near the presentation deadline.
+        // Keep a bounded half-second scheduled across readiness transitions.
+        // readyForMoreMediaData is advisory and exposes no decode deadline.
+        int space = ao->device_buffer - queued;
         *s = (struct mp_pcm_state){
             .queued_samples = queued,
             .free_samples = !p->failed && space >= 1536 ? space : 0,
