@@ -38,6 +38,8 @@ jobs:
           brew list ninja >/dev/null || brew install ninja
           git -C mpv apply ../kit/Sources/BuildScripts/patch/libmpv/0001-player-add-moltenvk-context.patch
           git -C mpv apply ../bilisail/joc-packet-probe.patch ../bilisail/embedded-cocoa.patch
+          git -C mpv apply ../bilisail/apple-joc-output.patch
+          cp bilisail/ao_apple_joc.m mpv/audio/out/
           python3 bilisail/build.py build ${{ matrix.target }}
       - name: Exercise compressed JOC renderer
         if: matrix.target == 'mac-arm'

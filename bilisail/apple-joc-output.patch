@@ -1,0 +1,259 @@
+diff --git a/audio/decode/ad_lavc.c b/audio/decode/ad_lavc.c
+index 62e30d2..2fcfb06 100644
+--- a/audio/decode/ad_lavc.c
++++ b/audio/decode/ad_lavc.c
+@@ -29,6 +29,7 @@
+ 
+ #include "mpv_talloc.h"
+ #include "audio/aframe.h"
++#include "audio/format.h"
+ #include "audio/chmap_avchannel.h"
+ #include "audio/fmt-conversion.h"
+ #include "common/av_common.h"
+@@ -44,6 +45,7 @@
+ 
+ struct priv {
+     struct mp_codec_params *codec;
++    struct mp_aframe_pool *joc_pool;
+     AVCodecContext *avctx;
+     AVFrame *avframe;
+     AVPacket *avpkt;
+@@ -141,6 +143,9 @@ static bool init(struct mp_filter *da, struct mp_codec_params *codec,
+ 
+     mp_set_avcodec_threads(da->log, ctx->avctx, opts->threads);
+ 
++    if (ctx->joc_pool)
++        ctx->avctx->flags |= AV_CODEC_FLAG_COPY_OPAQUE;
++
+     /* open it */
+     if (avcodec_open2(ctx->avctx, lavc_codec, NULL) < 0) {
+         MP_ERR(da, "Could not open codec.\n");
+@@ -188,7 +193,16 @@ static int send_packet(struct mp_filter *da, struct demux_packet *mpkt)
+ 
+     mp_set_av_packet(priv->avpkt, mpkt, &priv->codec_timebase);
+ 
++    // The decoder identifies the actual profile. Associate its output with the
++    // original access unit even if libavcodec buffers packets internally.
++    if (mpkt && priv->joc_pool && mpkt->len > 0 && mpkt->len <= 65536) {
++        AVBufferRef *ref = av_buffer_alloc(mpkt->len);
++        MP_HANDLE_OOM(ref);
++        memcpy(ref->data, mpkt->buffer, mpkt->len);
++        priv->avpkt->opaque_ref = ref;
++    }
+     int ret = avcodec_send_packet(avctx, mpkt ? priv->avpkt : NULL);
++    av_buffer_unref(&priv->avpkt->opaque_ref);
+     // A successfully accepted compressed input. Do not duplicate a packet
+     // when FFmpeg asks mpv to retry. Bytes are borrowed for this call only.
+     if (ret == 0 && mpkt && avctx->codec_id == AV_CODEC_ID_EAC3 &&
+@@ -228,8 +242,12 @@ static int receive_frame(struct mp_filter *da, struct mp_frame *out)
+ 
+     double out_pts = mp_pts_from_av(priv->avframe->pts, &priv->codec_timebase);
+ 
++    AVBufferRef *packet = NULL;
++    if (priv->joc_pool)
++        MPSWAP(AVBufferRef *, packet, priv->avframe->opaque_ref);
+     struct mp_aframe *mpframe = mp_aframe_from_avframe(priv->avframe);
+     if (!mpframe) {
++        av_buffer_unref(&packet);
+         MP_ERR(da, "Converting libavcodec frame to mpv frame failed.\n");
+         return ret;
+     }
+@@ -272,6 +290,23 @@ static int receive_frame(struct mp_filter *da, struct mp_frame *out)
+     // Strip possibly bogus float values like Infinity, NaN, denormalized
+     mp_aframe_sanitize_float(mpframe);
+ 
++    if (packet && avctx->profile == AV_PROFILE_EAC3_DDP_ATMOS &&
++        mp_aframe_get_size(mpframe) > 0) {
++        struct mp_aframe *encoded = mp_aframe_create();
++        mp_aframe_set_format(encoded, AF_FORMAT_APPLE_JOC);
++        mp_aframe_set_rate(encoded, avctx->sample_rate);
++        mp_aframe_set_chmap(encoded, &priv->codec->channels);
++        mp_aframe_set_pts(encoded, mp_aframe_get_pts(mpframe));
++        if (mp_aframe_pool_allocate(priv->joc_pool, encoded, mp_aframe_get_size(mpframe)) == 0) {
++            mp_aframe_get_raw_avframe(encoded)->buf[1] = packet;
++            packet = NULL;
++            talloc_free(mpframe);
++            mpframe = encoded;
++        } else {
++            talloc_free(encoded);
++        }
++    }
++    av_buffer_unref(&packet);
+     if (mp_aframe_get_size(mpframe) > 0) {
+         *out = MAKE_FRAME(MP_FRAME_AUDIO, mpframe);
+     } else {
+@@ -315,6 +350,10 @@ static struct mp_decoder *create(struct mp_filter *parent,
+     priv->codec = codec;
+     priv->public.f = da;
+ 
++    if (strcmp(decoder, "apple-joc") == 0) {
++        priv->joc_pool = mp_aframe_pool_create(da);
++        decoder = "eac3";
++    }
+     if (!init(da, codec, decoder)) {
+         talloc_free(da);
+         return NULL;
+diff --git a/audio/format.c b/audio/format.c
+index 4441456..bef5b1a 100644
+--- a/audio/format.c
++++ b/audio/format.c
+@@ -128,6 +128,7 @@ const char *af_fmt_to_str(int format)
+     case AF_FORMAT_S64P:        return "s64p";
+     case AF_FORMAT_FLOATP:      return "floatp";
+     case AF_FORMAT_DOUBLEP:     return "doublep";
++    case AF_FORMAT_APPLE_JOC:   return "apple-joc";
+     case AF_FORMAT_S_AAC:       return "spdif-aac";
+     case AF_FORMAT_S_AC3:       return "spdif-ac3";
+     case AF_FORMAT_S_DTS:       return "spdif-dts";
+@@ -259,6 +260,7 @@ int af_format_sample_alignment(int format)
+     case AF_FORMAT_S_AC3:       return 6144 / 4;
+     case AF_FORMAT_S_DTSHD:     return 32768 / 16;
+     case AF_FORMAT_S_DTS:       return 2048 / 4;
++    case AF_FORMAT_APPLE_JOC:   return 256; // one E-AC-3 audio block
+     case AF_FORMAT_S_EAC3:      return 24576 / 4;
+     case AF_FORMAT_S_MP3:       return 4608 / 4;
+     case AF_FORMAT_S_TRUEHD:    return 61440 / 16;
+diff --git a/audio/format.h b/audio/format.h
+index bdd4744..813e6fe 100644
+--- a/audio/format.h
++++ b/audio/format.h
+@@ -48,6 +48,7 @@ enum af_format {
+     AF_FORMAT_S_MP3,
+     AF_FORMAT_S_TRUEHD,
+ 
++    AF_FORMAT_APPLE_JOC, // Raw access unit attached to a timed frame.
+     AF_FORMAT_COUNT
+ };
+ 
+diff --git a/audio/out/ao.c b/audio/out/ao.c
+index 4e5e9e3..22377c0 100644
+--- a/audio/out/ao.c
++++ b/audio/out/ao.c
+@@ -49,6 +49,7 @@ extern const struct ao_driver audio_out_jack;
+ extern const struct ao_driver audio_out_openal;
+ extern const struct ao_driver audio_out_opensles;
+ extern const struct ao_driver audio_out_null;
++extern const struct ao_driver audio_out_apple_joc;
+ extern const struct ao_driver audio_out_alsa;
+ extern const struct ao_driver audio_out_wasapi;
+ extern const struct ao_driver audio_out_pcm;
+@@ -105,6 +106,7 @@ static const struct ao_driver * const audio_out_drivers[] = {
+     &audio_out_sndio,
+ #endif
+     &audio_out_null,
++    &audio_out_apple_joc,
+ #if HAVE_COREAUDIO
+     &audio_out_coreaudio_exclusive,
+ #endif
+@@ -294,6 +296,12 @@ struct ao *ao_init_best(struct mpv_global *global,
+                         struct encode_lavc_context *encode_lavc_ctx,
+                         int samplerate, int format, struct mp_chmap channels)
+ {
++    if (format == AF_FORMAT_APPLE_JOC) {
++        if (atomic_exchange(&global->apple_joc_failed, false))
++            return NULL; // Let the existing passthrough fallback reopen the PCM decoder.
++        return ao_init(false, global, wakeup_cb, wakeup_ctx, encode_lavc_ctx,
++                       init_flags, samplerate, format, channels, NULL, "apple-joc");
++    }
+     void *tmp = talloc_new(NULL);
+     struct ao_opts *opts = mp_get_config_group(tmp, global, &ao_conf);
+     struct mp_log *log = mp_log_new(tmp, global->log, "ao");
+diff --git a/audio/out/buffer.c b/audio/out/buffer.c
+index 277b524..83fa661 100644
+--- a/audio/out/buffer.c
++++ b/audio/out/buffer.c
+@@ -156,6 +156,8 @@ static int read_buffer(struct ao *ao, void **data, int samples, bool *eof,
+     if (!data) {
+         if (!p->pending)
+             return 0;
++        if (ao->format == AF_FORMAT_APPLE_JOC)
++            return 1; // AVFoundation applies volume to compressed audio.
+         void **pd = (void *)mp_aframe_get_data_rw(p->pending);
+         if (pd)
+             ao_post_process_data(ao, pd, mp_aframe_get_size(p->pending));
+diff --git a/common/global.h b/common/global.h
+index 2795ed6..1f555e7 100644
+--- a/common/global.h
++++ b/common/global.h
+@@ -1,6 +1,8 @@
+ #ifndef MPV_MPV_H
+ #define MPV_MPV_H
+ 
++#include <stdatomic.h>
++
+ // This should be accessed by glue code only, never normal code.
+ // The only purpose of this is to make mpv library-safe.
+ // Think hard before adding new members.
+@@ -11,6 +13,8 @@ struct mpv_global {
+     char *configdir;
+     struct stats_base *stats;
+     struct demux_packet_pool *packet_pool;
++    atomic_bool apple_joc_failed;
++    atomic_int apple_joc_packets;
+     // Installed before initialization by the Darwin compressed-audio probe only.
+     void *joc_probe_context;
+     void (*joc_probe)(void *, const unsigned char *, int, double, double);
+diff --git a/filters/f_decoder_wrapper.c b/filters/f_decoder_wrapper.c
+index 5e2e8d7..91ce180 100644
+--- a/filters/f_decoder_wrapper.c
++++ b/filters/f_decoder_wrapper.c
+@@ -422,7 +422,11 @@ static bool reinit_decoder(struct priv *p)
+         bool try_spdif = p->try_spdif;
+         mp_mutex_unlock(&p->cache_lock);
+ 
+-        if (try_spdif && p->codec->codec) {
++        if (try_spdif && p->codec->codec && strcmp(p->codec->codec, "eac3") == 0 &&
++            p->opts->audio_spdif && strcmp(p->opts->audio_spdif, "apple-joc") == 0) {
++            list = talloc_zero(NULL, struct mp_decoder_list);
++            mp_add_decoder(list, "eac3", "apple-joc", "Dolby Digital Plus with Apple JOC output");
++        } else if (try_spdif && p->codec->codec) {
+             struct mp_decoder_list *spdif =
+                 select_spdif_codec(p->codec->codec, p->opts->audio_spdif);
+             if (spdif->num_entries) {
+diff --git a/meson.build b/meson.build
+index fb10be5..d3e57b4 100644
+--- a/meson.build
++++ b/meson.build
+@@ -834,7 +834,8 @@ if features['coreaudio']
+ endif
+ 
+ if features['audiounit'] or features['coreaudio'] or features['avfoundation']
+-    sources += files('audio/out/ao_coreaudio_chmap.c',
++    sources += files('audio/out/ao_apple_joc.m',
++                     'audio/out/ao_coreaudio_chmap.c',
+                      'audio/out/ao_coreaudio_utils.c')
+ endif
+ 
+diff --git a/player/command.c b/player/command.c
+index 96bc06a..57e1e70 100644
+--- a/player/command.c
++++ b/player/command.c
+@@ -36,6 +36,7 @@
+ #include "external_files.h"
+ #include "common/av_common.h"
+ #include "common/codecs.h"
++#include "common/global.h"
+ #include "common/msg.h"
+ #include "common/msg_control.h"
+ #include "common/stats.h"
+@@ -1855,6 +1856,12 @@ static int mp_property_audio_devices(void *ctx, struct m_property *prop,
+                                 get_device_entry, list);
+ }
+ 
++static int mp_property_apple_joc_packets(void *ctx, struct m_property *p, int action, void *arg)
++{
++    struct MPContext *mpctx = ctx;
++    return m_property_int_ro(action, arg, atomic_load(&mpctx->global->apple_joc_packets));
++}
++
+ static int mp_property_ao(void *ctx, struct m_property *p, int action, void *arg)
+ {
+     MPContext *mpctx = ctx;
+@@ -4440,6 +4447,7 @@ static const struct m_property mp_properties_base[] = {
+     {"audio-device", mp_property_audio_device},
+     {"audio-device-list", mp_property_audio_devices},
+     {"current-ao", mp_property_ao},
++    {"apple-joc-rendered-packets", mp_property_apple_joc_packets},
+ 
+     // Video
+     {"video-target-params", mp_property_tgt_imgparams},
