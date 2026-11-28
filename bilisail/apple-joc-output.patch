@@ -1,5 +1,5 @@
 diff --git a/audio/decode/ad_lavc.c b/audio/decode/ad_lavc.c
-index 62e30d2..2fcfb06 100644
+index 62e30d2..d1857e2 100644
 --- a/audio/decode/ad_lavc.c
 +++ b/audio/decode/ad_lavc.c
 @@ -29,6 +29,7 @@
@@ -10,15 +10,21 @@ index 62e30d2..2fcfb06 100644
  #include "audio/chmap_avchannel.h"
  #include "audio/fmt-conversion.h"
  #include "common/av_common.h"
-@@ -44,6 +45,7 @@
+@@ -42,8 +43,13 @@
+ #include "options/m_config.h"
+ #include "options/options.h"
  
++AVBufferRef *mp_apple_joc_format(AVBufferRef *unit, int rate, int channels, int frames);
++
  struct priv {
      struct mp_codec_params *codec;
 +    struct mp_aframe_pool *joc_pool;
++    AVBufferRef *joc_format;
++    int joc_rate, joc_channels;
      AVCodecContext *avctx;
      AVFrame *avframe;
      AVPacket *avpkt;
-@@ -141,6 +143,9 @@ static bool init(struct mp_filter *da, struct mp_codec_params *codec,
+@@ -141,6 +147,9 @@ static bool init(struct mp_filter *da, struct mp_codec_params *codec,
  
      mp_set_avcodec_threads(da->log, ctx->avctx, opts->threads);
  
@@ -28,7 +34,24 @@ index 62e30d2..2fcfb06 100644
      /* open it */
      if (avcodec_open2(ctx->avctx, lavc_codec, NULL) < 0) {
          MP_ERR(da, "Could not open codec.\n");
-@@ -188,7 +193,16 @@ static int send_packet(struct mp_filter *da, struct demux_packet *mpkt)
+@@ -156,6 +165,7 @@ static void ad_lavc_destroy(struct mp_filter *da)
+ {
+     struct priv *ctx = da->priv;
+
++    av_buffer_unref(&ctx->joc_format);
+     avcodec_free_context(&ctx->avctx);
+     av_frame_free(&ctx->avframe);
+     mp_free_av_packet(&ctx->avpkt);
+@@ -167,6 +177,8 @@ static void ad_lavc_reset(struct mp_filter *da)
+     if (ctx->avctx && ctx->avctx->codec_id == AV_CODEC_ID_EAC3 && da->global->joc_probe)
+         da->global->joc_probe(da->global->joc_probe_context, NULL, 0, 0, 0);
+
++    av_buffer_unref(&ctx->joc_format);
++    ctx->joc_rate = ctx->joc_channels = 0;
+     avcodec_flush_buffers(ctx->avctx);
+     ctx->skip_samples = 0;
+     ctx->trim_samples = 0;
+@@ -188,7 +200,16 @@ static int send_packet(struct mp_filter *da, struct demux_packet *mpkt)
  
      mp_set_av_packet(priv->avpkt, mpkt, &priv->codec_timebase);
  
@@ -45,7 +68,7 @@ index 62e30d2..2fcfb06 100644
      // A successfully accepted compressed input. Do not duplicate a packet
      // when FFmpeg asks mpv to retry. Bytes are borrowed for this call only.
      if (ret == 0 && mpkt && avctx->codec_id == AV_CODEC_ID_EAC3 &&
-@@ -228,8 +242,12 @@ static int receive_frame(struct mp_filter *da, struct mp_frame *out)
+@@ -228,8 +249,12 @@ static int receive_frame(struct mp_filter *da, struct mp_frame *out)
  
      double out_pts = mp_pts_from_av(priv->avframe->pts, &priv->codec_timebase);
  
@@ -58,19 +81,35 @@ index 62e30d2..2fcfb06 100644
          MP_ERR(da, "Converting libavcodec frame to mpv frame failed.\n");
          return ret;
      }
-@@ -272,6 +290,23 @@ static int receive_frame(struct mp_filter *da, struct mp_frame *out)
+@@ -272,6 +297,39 @@ static int receive_frame(struct mp_filter *da, struct mp_frame *out)
      // Strip possibly bogus float values like Infinity, NaN, denormalized
      mp_aframe_sanitize_float(mpframe);
  
-+    if (packet && avctx->profile == AV_PROFILE_EAC3_DDP_ATMOS &&
-+        mp_aframe_get_size(mpframe) > 0) {
++    bool joc = packet && avctx->profile == AV_PROFILE_EAC3_DDP_ATMOS;
++    if (joc && (priv->joc_rate != avctx->sample_rate ||
++                priv->joc_channels != priv->codec->channels.num)) {
++        // Negotiate before discarding any decoded PCM. A format Apple cannot
++        // render stays audible from its first frame, even for a short clip.
++        av_buffer_unref(&priv->joc_format);
++        priv->joc_rate = avctx->sample_rate;
++        priv->joc_channels = priv->codec->channels.num;
++        priv->joc_format = mp_apple_joc_format(packet, priv->joc_rate,
++                                               priv->joc_channels, priv->avframe->nb_samples);
++    } else if (!joc && priv->joc_rate) {
++        av_buffer_unref(&priv->joc_format);
++        priv->joc_rate = priv->joc_channels = 0;
++    }
++    if (joc && priv->joc_format && mp_aframe_get_size(mpframe) > 0) {
 +        struct mp_aframe *encoded = mp_aframe_create();
 +        mp_aframe_set_format(encoded, AF_FORMAT_APPLE_JOC);
 +        mp_aframe_set_rate(encoded, avctx->sample_rate);
 +        mp_aframe_set_chmap(encoded, &priv->codec->channels);
 +        mp_aframe_set_pts(encoded, mp_aframe_get_pts(mpframe));
 +        if (mp_aframe_pool_allocate(priv->joc_pool, encoded, mp_aframe_get_size(mpframe)) == 0) {
-+            mp_aframe_get_raw_avframe(encoded)->buf[1] = packet;
++            AVFrame *raw = mp_aframe_get_raw_avframe(encoded);
++            raw->buf[1] = packet;
++            raw->buf[2] = av_buffer_ref(priv->joc_format);
++            MP_HANDLE_OOM(raw->buf[2]);
 +            packet = NULL;
 +            talloc_free(mpframe);
 +            mpframe = encoded;
@@ -82,7 +121,7 @@ index 62e30d2..2fcfb06 100644
      if (mp_aframe_get_size(mpframe) > 0) {
          *out = MAKE_FRAME(MP_FRAME_AUDIO, mpframe);
      } else {
-@@ -315,6 +350,10 @@ static struct mp_decoder *create(struct mp_filter *parent,
+@@ -315,6 +373,10 @@ static struct mp_decoder *create(struct mp_filter *parent,
      priv->codec = codec;
      priv->public.f = da;
  

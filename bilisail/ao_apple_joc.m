@@ -3,6 +3,7 @@
 #import <AVFoundation/AVFoundation.h>
 #import <AudioToolbox/AudioToolbox.h>
 #import <CoreMedia/CMFormatDescriptionBridge.h>
+#include <libavcodec/ac3_parser.h>
 #include <libavformat/avformat.h>
 #include <libavutil/intreadwrite.h>
 #include "audio/aframe.h"
@@ -12,6 +13,7 @@
 #include "common/global.h"
 #include "common/msg.h"
 #include "osdep/timer.h"
+#include "joc_dependent.h"
 
 // Notifications may arrive during enqueue or destruction on an AVFoundation
 // thread. Only the AO, under mpv's push-buffer lock, touches the sample queue.
@@ -35,7 +37,6 @@ struct priv {
     AVSampleBufferRenderSynchronizer *sync;
     BiliJocOutputObserver *observer;
     NSMutableArray *pending; // Original compressed samples within the AO's 500 ms lead.
-    CMAudioFormatDescriptionRef format;
     int64_t end;
     int submitted;
     bool failed;
@@ -58,11 +59,71 @@ static const uint8_t *child(const uint8_t *p, size_t *size, const char tag[4])
     return NULL;
 }
 
-static CMAudioFormatDescriptionRef make_format(struct ao *ao, AVBufferRef *unit, int frames)
+// movenc derives the JOC extension and bitrate from the first syncframe. For
+// a Blu-ray access unit that frame is the AC-3 core; the objects are carried
+// by the following E-AC-3 dependent stream. Keep every compressed byte intact.
+static CMAudioFormatDescriptionRef apple_format(const uint8_t *entry, size_t length,
+                                                AVBufferRef *unit, int rate)
 {
-    // MOV's dec3 writer parses the real bitstream, including dependent
-    // substreams and the JOC complexity index. This also works for Matroska,
-    // which need not carry a QuickTime sound description.
+    uint8_t bsid;
+    uint16_t first;
+    if (av_ac3_parse_header(unit->data, unit->size, &bsid, &first) < 0 ||
+        !first || first > unit->size) return NULL;
+    if (first < unit->size) {
+        struct joc_dependent_info info = {0};
+        unsigned count = 0;
+        for (size_t pos = first; pos < unit->size;) {
+            uint16_t size;
+            uint8_t id;
+            if (av_ac3_parse_header(unit->data + pos, unit->size - pos, &id, &size) < 0 ||
+                id <= 10 || !size || size > unit->size - pos || ++count > 15 ||
+                !joc_read_dependent(unit->data + pos, size, &info)) return NULL;
+            pos += size;
+        }
+        // Version-zero ISO audio sample entry, one independent substream.
+        if (length < 36 || AV_RB16(entry + 16) != 0) return NULL;
+        size_t atom_size = length - 36;
+        const uint8_t *atom = child(entry + 36, &atom_size, "dec3");
+        if (!atom || (atom_size != 6 && atom_size != 8) || (atom[1] & 7) ||
+            ((AV_RB16(atom + 4) >> 9) & 15) != count) return NULL;
+        uint8_t descriptor[8];
+        memcpy(descriptor, atom, atom_size);
+        static const int blocks[] = {1, 2, 3, 6};
+        int samples = 1536;
+        if (bsid > 10 && (unit->data[4] >> 6) != 3)
+            samples = 256 * blocks[(unit->data[4] >> 4) & 3];
+        uint64_t kbps = ((uint64_t)unit->size * 8 * rate + samples * 1000 - 1) /
+                        (samples * 1000);
+        if (kbps > 0x1fff) return NULL;
+        AV_WB16(descriptor, kbps << 3);
+        AV_WB16(descriptor + 4, (AV_RB16(atom + 4) & ~0x1ff) | info.locations);
+        size_t new_size = atom_size;
+        if (info.complexity) {
+            descriptor[6] = 1;
+            descriptor[7] = info.complexity;
+            new_size = sizeof(descriptor);
+        }
+        NSMutableData *updated = [NSMutableData dataWithBytes:entry length:length];
+        size_t offset = atom - entry;
+        [updated replaceBytesInRange:NSMakeRange(offset, atom_size)
+                           withBytes:descriptor length:new_size];
+        uint8_t *bytes = updated.mutableBytes;
+        length = updated.length;
+        AV_WB32(bytes, length);
+        AV_WB32(bytes + offset - 8, new_size + 8);
+        entry = bytes;
+    }
+    CMAudioFormatDescriptionRef fmt = NULL;
+    if (CMAudioFormatDescriptionCreateFromBigEndianSoundDescriptionData(
+            NULL, entry, length, kCMSoundDescriptionFlavor_ISOFamily, &fmt) != noErr)
+        return NULL;
+    return fmt;
+}
+
+static CMAudioFormatDescriptionRef make_format(AVBufferRef *unit, int rate, int channels, int frames)
+{
+    // Build a container-independent base description for MP4, DASH and MKV.
+    // apple_format fills in metadata carried by dependent syncframes.
     AVFormatContext *mux = NULL;
     AVPacket *pkt = NULL;
     uint8_t *bytes = NULL;
@@ -72,10 +133,10 @@ static CMAudioFormatDescriptionRef make_format(struct ao *ao, AVBufferRef *unit,
     if (!stream || avio_open_dyn_buf(&mux->pb) < 0) goto done;
     stream->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
     stream->codecpar->codec_id = AV_CODEC_ID_EAC3;
-    stream->codecpar->sample_rate = ao->samplerate;
+    stream->codecpar->sample_rate = rate;
     stream->codecpar->frame_size = frames;
-    av_channel_layout_default(&stream->codecpar->ch_layout, ao->channels.num);
-    stream->time_base = (AVRational){1, ao->samplerate};
+    av_channel_layout_default(&stream->codecpar->ch_layout, channels);
+    stream->time_base = (AVRational){1, rate};
     if (avformat_write_header(mux, NULL) < 0) goto done;
     pkt = av_packet_alloc();
     if (!pkt || av_new_packet(pkt, unit->size) < 0) goto done;
@@ -101,9 +162,7 @@ static CMAudioFormatDescriptionRef make_format(struct ao *ao, AVBufferRef *unit,
     if (size < 16 || AV_RB32(p + 4) != 1) goto done;
     size -= 8;
     p = child(p + 8, &size, "ec-3");
-    if (!p || CMAudioFormatDescriptionCreateFromBigEndianSoundDescriptionData(
-            NULL, p - 8, size + 8, kCMSoundDescriptionFlavor_ISOFamily, &fmt) != noErr)
-        goto done;
+    if (!p || !(fmt = apple_format(p - 8, size + 8, unit, rate))) goto done;
     const AudioStreamBasicDescription *asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fmt);
     size_t list_size = 0;
     const AudioFormatListItem *list = CMAudioFormatDescriptionGetFormatList(fmt, &list_size);
@@ -120,6 +179,24 @@ done:
     av_packet_free(&pkt);
     avformat_free_context(mux);
     return fmt;
+}
+
+static void release_format(void *opaque, uint8_t *data)
+{
+    CFRelease((CMAudioFormatDescriptionRef)data);
+}
+
+// Owned by the decoder and referenced by each encoded frame sent to the AO.
+AVBufferRef *mp_apple_joc_format(AVBufferRef *unit, int rate, int channels, int frames)
+{
+    @autoreleasepool {
+        CMAudioFormatDescriptionRef fmt = make_format(unit, rate, channels, frames);
+        if (!fmt) return NULL;
+        AVBufferRef *ref = av_buffer_create((uint8_t *)fmt, 0, release_format, NULL,
+                                            AV_BUFFER_FLAG_READONLY);
+        if (!ref) CFRelease(fmt);
+        return ref;
+    }
 }
 
 static void reject(struct ao *ao, const char *reason)
@@ -167,7 +244,8 @@ static bool write_frame(struct ao *ao, void **data, int frames)
     @autoreleasepool {
         struct priv *p = ao->priv;
         struct mp_aframe *frame = *data;
-        AVBufferRef *packet = mp_aframe_get_raw_avframe(frame)->buf[1];
+        AVFrame *raw = mp_aframe_get_raw_avframe(frame);
+        AVBufferRef *packet = raw->buf[1];
         int samples = mp_aframe_get_size(frame);
         // Preserve contiguous timestamps unless the audio clock has already
         // passed the last queued sample after an actual underrun.
@@ -175,15 +253,16 @@ static bool write_frame(struct ao *ao, void **data, int frames)
         int64_t start = MPMAX(clock, p->end);
         p->end = start + samples;
         if (!packet) return true; // mpv inserted a timed silence interval.
-        if (!p->format) p->format = make_format(ao, packet, samples);
+        CMAudioFormatDescriptionRef fmt = raw->buf[2] ?
+            (CMAudioFormatDescriptionRef)raw->buf[2]->data : NULL;
         CMBlockBufferRef block = NULL;
         CMSampleBufferRef sample = NULL;
-        if (p->format && CMBlockBufferCreateWithMemoryBlock(NULL, NULL, packet->size,
+        if (fmt && CMBlockBufferCreateWithMemoryBlock(NULL, NULL, packet->size,
                 NULL, NULL, 0, packet->size, kCMBlockBufferAssureMemoryNowFlag, &block) == noErr &&
             CMBlockBufferReplaceDataBytes(packet->data, block, 0, packet->size) == noErr) {
-            const AudioStreamBasicDescription *asbd = CMAudioFormatDescriptionGetStreamBasicDescription(p->format);
+            const AudioStreamBasicDescription *asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fmt);
             AudioStreamPacketDescription desc = {0, asbd->mFramesPerPacket ? 0 : samples, (UInt32)packet->size};
-            CMAudioSampleBufferCreateReadyWithPacketDescriptions(NULL, block, p->format,
+            CMAudioSampleBufferCreateReadyWithPacketDescriptions(NULL, block, fmt,
                 1, CMTimeMake(start, ao->samplerate), &desc, &sample);
         }
         if (block) CFRelease(block);
@@ -282,7 +361,6 @@ static void uninit(struct ao *ao)
     reset(ao);
     [p->observer release];
     [p->pending release];
-    if (p->format) CFRelease(p->format);
     [p->sync release];
     [p->renderer release];
 }
