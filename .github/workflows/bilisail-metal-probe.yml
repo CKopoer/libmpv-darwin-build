@@ -1,7 +1,7 @@
 name: BiliSail Darwin EDR
 on:
   push:
-    branches: [codex/apple-edr-joc]
+    branches: [codex/apple-edr-joc, codex/apple-joc-spatial-audio]
   workflow_dispatch:
 permissions:
   contents: read
@@ -47,6 +47,11 @@ jobs:
           curl --fail --silent --show-error -L --range 0-33554431 --max-time 180 'https://media.developer.dolby.com/DolbyVision_Atmos/mp4/iOS_P5_GlassBlowing2_1920x1080%4059.94fps_15200kbps.mp4' -o sample-prefix.mp4
           echo '2e1a62c39519ccef267353672aff6c2985b7ef145739fb60b56029fa91ec6fac  sample-prefix.mp4' | shasum -a 256 -c -
           ./joc-probe sample-prefix.mp4
+          clang -fobjc-arc -I mpv/include bilisail/joc_route_probe.m slices/mac-arm/Mpv \
+            -framework AVFoundation -framework Foundation -framework CoreMedia -o joc-route-probe
+          install_name_tool -change @rpath/Mpv.framework/Mpv "$PWD/slices/mac-arm/Mpv" joc-route-probe
+          codesign --force --sign - joc-route-probe
+          ./joc-route-probe sample-prefix.mp4
       - uses: actions/upload-artifact@v4
         with:
           name: slice-${{ matrix.target }}

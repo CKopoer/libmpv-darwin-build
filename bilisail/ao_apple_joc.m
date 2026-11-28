@@ -13,6 +13,19 @@
 #include "common/msg.h"
 #include "osdep/timer.h"
 
+// Notifications may arrive during enqueue or destruction on an AVFoundation
+// thread. Only the AO, under mpv's push-buffer lock, touches the sample queue.
+@interface BiliJocOutputObserver : NSObject {
+    atomic_bool changed;
+}
+- (void)outputChanged:(NSNotification *)notification;
+- (BOOL)takeChange;
+@end
+@implementation BiliJocOutputObserver
+- (void)outputChanged:(NSNotification *)notification { atomic_store(&changed, true); }
+- (BOOL)takeChange { return atomic_exchange(&changed, false); }
+@end
+
 struct priv {
     bool started;
     int64_t last_clock;
@@ -20,6 +33,8 @@ struct priv {
     float volume;
     AVSampleBufferAudioRenderer *renderer;
     AVSampleBufferRenderSynchronizer *sync;
+    BiliJocOutputObserver *observer;
+    NSMutableArray *pending; // Original compressed samples within the AO's 500 ms lead.
     CMAudioFormatDescriptionRef format;
     int64_t end;
     int submitted;
@@ -127,6 +142,26 @@ static int64_t now(struct ao *ao)
         CMTimeConvertScale(t, ao->samplerate, kCMTimeRoundingMethod_Default).value : 0;
 }
 
+static void update_output(struct ao *ao, int64_t clock)
+{
+    struct priv *p = ao->priv;
+    CMTime playhead = CMTimeMake(clock, ao->samplerate);
+    while (p->pending.count) {
+        CMSampleBufferRef first = (CMSampleBufferRef)p->pending.firstObject;
+        if (CMTimeCompare(CMSampleBufferGetPresentationTimeStamp(first), playhead) >= 0)
+            break;
+        [p->pending removeObjectAtIndex:0];
+    }
+    if (![p->observer takeChange] || p->failed) return;
+
+    // Clear samples which raced an automatic flush, then negotiate the new
+    // output with whole JOC packets at their original, still-future times.
+    // Keep the synchronizer's rate (including pause) and mpv's media clock.
+    [p->renderer flush];
+    for (id sample in p->pending)
+        [p->renderer enqueueSampleBuffer:(CMSampleBufferRef)sample];
+}
+
 static bool write_frame(struct ao *ao, void **data, int frames)
 {
     @autoreleasepool {
@@ -166,6 +201,7 @@ static bool write_frame(struct ao *ao, void **data, int frames)
             reject(ao, "packet duration mismatch");
             return false;
         }
+        [p->pending addObject:(id)sample];
         [p->renderer enqueueSampleBuffer:sample];
         CFRelease(sample);
         if (p->submitted < INT_MAX) p->submitted++;
@@ -184,6 +220,7 @@ static void get_state(struct ao *ao, struct mp_pcm_state *s)
             p->volume = volume;
         }
         int64_t clock = now(ao);
+        update_output(ao, clock);
         int queued = MPCLAMP(p->end - clock, 0, ao->device_buffer);
         if (p->renderer.status == AVQueuedSampleBufferRenderingStatusFailed)
             reject(ao, "renderer failed");
@@ -217,6 +254,7 @@ static void get_state(struct ao *ao, struct mp_pcm_state *s)
 static bool set_pause(struct ao *ao, bool paused)
 {
     struct priv *p = ao->priv;
+    if (!paused) update_output(ao, now(ao));
     p->started = !paused;
     p->last_progress_ns = mp_time_ns();
     [p->sync setRate:paused ? 0 : 1];
@@ -227,6 +265,8 @@ static void start(struct ao *ao) { set_pause(ao, false); }
 static void reset(struct ao *ao)
 {
     struct priv *p = ao->priv;
+    [p->observer takeChange];
+    [p->pending removeAllObjects];
     p->started = false;
     [p->sync setRate:0 time:kCMTimeZero];
     [p->renderer flush];
@@ -238,7 +278,10 @@ static void reset(struct ao *ao)
 static void uninit(struct ao *ao)
 {
     struct priv *p = ao->priv;
+    if (p->observer) [[NSNotificationCenter defaultCenter] removeObserver:p->observer];
     reset(ao);
+    [p->observer release];
+    [p->pending release];
     if (p->format) CFRelease(p->format);
     [p->sync release];
     [p->renderer release];
@@ -255,10 +298,21 @@ static int init(struct ao *ao)
 #endif
     p->renderer = [[AVSampleBufferAudioRenderer alloc] init];
     p->sync = [[AVSampleBufferRenderSynchronizer alloc] init];
-    if (!p->renderer || !p->sync) {
+    p->observer = [BiliJocOutputObserver new];
+    p->pending = [NSMutableArray new];
+    if (!p->renderer || !p->sync || !p->observer || !p->pending) {
         uninit(ao);
         return -1;
     }
+    NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
+    [center addObserver:p->observer selector:@selector(outputChanged:)
+                   name:AVSampleBufferAudioRendererOutputConfigurationDidChangeNotification object:p->renderer];
+    [center addObserver:p->observer selector:@selector(outputChanged:)
+                   name:AVSampleBufferAudioRendererWasFlushedAutomaticallyNotification object:p->renderer];
+#if TARGET_OS_IPHONE
+    [center addObserver:p->observer selector:@selector(outputChanged:)
+                   name:AVAudioSessionSpatialPlaybackCapabilitiesChangedNotification object:session];
+#endif
     [p->sync addRenderer:p->renderer];
     p->sync.delaysRateChangeUntilHasSufficientMediaData = YES;
     p->volume = -1;
